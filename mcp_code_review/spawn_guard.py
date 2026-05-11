@@ -1,4 +1,5 @@
 import os
+import subprocess
 from typing import Iterable, Iterator, Optional
 
 
@@ -21,12 +22,32 @@ def find_guarded_app_server_in_cmdlines(cmdlines: Iterable[str]) -> Optional[str
     return None
 
 
+def _read_via_ps(pid: int, field: str) -> Optional[str]:
+    # Fallback for systems where /proc isn't available (macOS, *BSD). Uses
+    # `ps -p PID -o <field>=` which is POSIX-standard. `field` is always a
+    # literal ("command" or "ppid") from this module — no injection surface.
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", f"{field}="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output if output else None
+
+
 def read_proc_cmdline(pid: int) -> Optional[str]:
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as handle:
             data = handle.read()
     except OSError:
-        return None
+        # /proc isn't available on macOS/BSD — fall back to `ps`.
+        return _read_via_ps(pid, "command")
     if not data:
         return None
     return data.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
@@ -41,7 +62,11 @@ def read_proc_parent_pid(pid: int) -> Optional[int]:
                     if len(parts) >= 2 and parts[1].isdigit():
                         return int(parts[1])
     except OSError:
-        return None
+        # /proc isn't available on macOS/BSD — fall back to `ps`.
+        ppid = _read_via_ps(pid, "ppid")
+        if ppid is None:
+            return None
+        return int(ppid) if ppid.isdigit() else None
     return None
 
 
