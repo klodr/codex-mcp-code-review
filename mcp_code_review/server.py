@@ -15,6 +15,11 @@ from mcp_code_review.spawn_guard import find_guarded_app_server_ancestor_cmdline
 
 
 TOOL_NAME = "review_uncommitted_changes"
+TOOL_NAME_FULL_REPO = "review_full_repo"
+# Codex config override applied automatically when full-repo mode is used.
+# Pushes the underlying model into its highest reasoning tier so the audit
+# walks deeper into the codebase instead of skimming entry points.
+FULL_REPO_CODEX_OVERRIDES = ['model_reasoning_effort="high"']
 FEATURE_ADDITIONAL_REVIEW_INSTRUCTIONS = "additional_review_instructions"
 SUPPORTED_FEATURES = frozenset({FEATURE_ADDITIONAL_REVIEW_INSTRUCTIONS})
 DEFAULT_ENABLED_FEATURES = frozenset({FEATURE_ADDITIONAL_REVIEW_INSTRUCTIONS})
@@ -53,7 +58,7 @@ def is_feature_enabled(config: ServerConfig, feature: str) -> bool:
     return feature in config.enabled_features
 
 
-def tool_definition(config: ServerConfig) -> Dict[str, Any]:
+def _shared_input_properties(config: ServerConfig) -> Dict[str, Any]:
     properties: Dict[str, Any] = {
         "cwd": {"type": "string", "description": "Repository root to review."},
         "runs": {
@@ -70,37 +75,64 @@ def tool_definition(config: ServerConfig) -> Dict[str, Any]:
                 "an issue during review."
             ),
         }
+    return properties
 
+
+_REVIEW_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "results": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "verdict": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "comment_markdown": {"type": "string"},
+                },
+                "required": ["index", "verdict", "summary", "comment_markdown"],
+            },
+        }
+    },
+    "required": ["results"],
+}
+
+
+def tool_definition(config: ServerConfig) -> Dict[str, Any]:
     return {
         "name": TOOL_NAME,
         "title": "Review uncommitted changes",
         "description": (
-            "Run Codex review on uncommitted changes using the app-server review API. "
+            "Run Codex review on uncommitted changes (staged, unstaged, and "
+            "untracked) using the app-server review API. Returns structured "
+            "results for each run."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": _shared_input_properties(config),
+        },
+        "outputSchema": _REVIEW_OUTPUT_SCHEMA,
+    }
+
+
+def full_repo_tool_definition(config: ServerConfig) -> Dict[str, Any]:
+    return {
+        "name": TOOL_NAME_FULL_REPO,
+        "title": "Review entire repository",
+        "description": (
+            "Run Codex audit on the entire repository (not just uncommitted "
+            "changes). Codex walks the project tree from the entry points and "
+            "produces prioritized P0/P1 findings. Runs in parallel (set `runs` "
+            "for multi-run vote aggregation) at maximum reasoning effort. "
+            "Sandbox=read-only and approvalPolicy=never are forced upstream. "
             "Returns structured results for each run."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": properties,
+            "properties": _shared_input_properties(config),
         },
-        "outputSchema": {
-            "type": "object",
-            "properties": {
-                "results": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer"},
-                            "verdict": {"type": "string"},
-                            "summary": {"type": "string"},
-                            "comment_markdown": {"type": "string"},
-                        },
-                        "required": ["index", "verdict", "summary", "comment_markdown"],
-                    },
-                }
-            },
-            "required": ["results"],
-        },
+        "outputSchema": _REVIEW_OUTPUT_SCHEMA,
     }
 
 
@@ -276,7 +308,13 @@ async def handle_tool_call(
     config: ServerConfig,
 ) -> Dict[str, Any]:
     name = params.get("name")
-    if name != TOOL_NAME:
+    if name == TOOL_NAME:
+        review_mode = "uncommitted"
+        extra_config_overrides: Optional[list[str]] = None
+    elif name == TOOL_NAME_FULL_REPO:
+        review_mode = "full_repo"
+        extra_config_overrides = list(FULL_REPO_CODEX_OVERRIDES)
+    else:
         return jsonrpc_error(request_id, -32601, f"unknown tool: {name}")
 
     if shutil.which(config.codex_bin) is None:
@@ -299,6 +337,8 @@ async def handle_tool_call(
             model_provider=args["model_provider"],
             profile=args["profile"],
             additional_developer_instructions=args["additional_developer_instructions"],
+            review_mode=review_mode,
+            extra_config_overrides=extra_config_overrides,
         )
     except Exception as exc:
         return jsonrpc_response(
@@ -392,7 +432,10 @@ async def handle_request(
         return jsonrpc_response(request_id, result)
 
     if method == "tools/list":
-        return jsonrpc_response(request_id, {"tools": [tool_definition(config)]})
+        return jsonrpc_response(
+            request_id,
+            {"tools": [tool_definition(config), full_repo_tool_definition(config)]},
+        )
 
     if method == "tools/call":
         params = message.get("params") or {}

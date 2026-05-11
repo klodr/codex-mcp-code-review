@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from mcp_code_review.review import ReviewResult, parse_review_output
 from mcp_code_review.review_prompts import (
     append_additional_review_instructions,
+    build_full_repo_review_prompt,
     build_uncommitted_changes_review_prompt,
 )
 from mcp_code_review.spawn_guard import SPAWN_GUARD_CONFIG_ASSIGNMENT
@@ -149,6 +150,7 @@ def build_app_server_command(
     codex_bin: str,
     profile: Optional[str],
     mcp_server_names: List[str],
+    extra_config_overrides: Optional[List[str]] = None,
 ) -> List[str]:
     command = [codex_bin]
     if profile:
@@ -158,6 +160,12 @@ def build_app_server_command(
     command.extend(["-c", SPAWN_GUARD_CONFIG_ASSIGNMENT])
     for name in mcp_server_names:
         command.extend(["-c", f"mcp_servers.{name}.enabled=false"])
+    # Caller-supplied overrides come last so they take precedence over the
+    # MCP server's own defaults. Each entry is passed verbatim as a `-c`
+    # assignment (e.g. `model_reasoning_effort=high`). The caller is
+    # trusted (server-side only — never originates from MCP tool input).
+    for assignment in extra_config_overrides or []:
+        command.extend(["-c", assignment])
     command.append("app-server")
     return command
 
@@ -259,9 +267,15 @@ class AppServerClient:
         codex_bin: str,
         env: Optional[Dict[str, str]] = None,
         profile: Optional[str] = None,
+        extra_config_overrides: Optional[List[str]] = None,
     ) -> "AppServerClient":
         mcp_server_names = await list_mcp_server_names_with_retry(codex_bin, profile=profile, env=env)
-        cmd = build_app_server_command(codex_bin, profile, mcp_server_names)
+        cmd = build_app_server_command(
+            codex_bin,
+            profile,
+            mcp_server_names,
+            extra_config_overrides=extra_config_overrides,
+        )
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -441,6 +455,7 @@ async def run_single_review(
     model: Optional[str] = None,
     model_provider: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
+    review_mode: str = "uncommitted",
 ) -> ReviewResult:
     thread_params: Dict[str, Any] = {
         "cwd": cwd,
@@ -458,19 +473,34 @@ async def run_single_review(
     if not thread_id:
         raise AppServerError("thread/start missing thread id")
 
-    target: Dict[str, Any] = {"type": "uncommittedChanges"}
-    if additional_developer_instructions:
-        # This intentionally mirrors codex-gitlab-code-review: issue-evaluation context belongs on
-        # the review target itself, not as generic thread-level developer instructions. Preserve
-        # native uncommitted-changes semantics by starting from the synced upstream prompt and
-        # appending the extra section.
-        target = {
+    if review_mode == "full_repo":
+        # Custom target — Codex has no native full-repo review API, so we
+        # send the audit prompt as a `custom` target instructing the model
+        # to walk the codebase end-to-end. The sub-process is still
+        # sandbox=read-only / approvalPolicy=never (set above).
+        base_prompt = build_full_repo_review_prompt()
+        target: Dict[str, Any] = {
             "type": "custom",
-            "instructions": append_additional_review_instructions(
-                build_uncommitted_changes_review_prompt(),
-                additional_developer_instructions,
+            "instructions": (
+                append_additional_review_instructions(base_prompt, additional_developer_instructions)
+                if additional_developer_instructions
+                else base_prompt
             ),
         }
+    else:
+        target = {"type": "uncommittedChanges"}
+        if additional_developer_instructions:
+            # This intentionally mirrors codex-gitlab-code-review: issue-evaluation context belongs on
+            # the review target itself, not as generic thread-level developer instructions. Preserve
+            # native uncommitted-changes semantics by starting from the synced upstream prompt and
+            # appending the extra section.
+            target = {
+                "type": "custom",
+                "instructions": append_additional_review_instructions(
+                    build_uncommitted_changes_review_prompt(),
+                    additional_developer_instructions,
+                ),
+            }
 
     review_response = await client.request(
         "review/start",
@@ -507,8 +537,14 @@ async def run_reviews_threads(
     model_provider: Optional[str] = None,
     profile: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
+    review_mode: str = "uncommitted",
+    extra_config_overrides: Optional[List[str]] = None,
 ) -> List[ReviewResult]:
-    client = await AppServerClient.start(codex_bin, profile=profile)
+    client = await AppServerClient.start(
+        codex_bin,
+        profile=profile,
+        extra_config_overrides=extra_config_overrides,
+    )
     try:
         await client.initialize()
         tasks = [
@@ -520,6 +556,7 @@ async def run_reviews_threads(
                     model=model,
                     model_provider=model_provider,
                     additional_developer_instructions=additional_developer_instructions,
+                    review_mode=review_mode,
                 )
             )
             for _ in range(parallelism)
@@ -552,8 +589,14 @@ async def run_review_process(
     model_provider: Optional[str] = None,
     profile: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
+    review_mode: str = "uncommitted",
+    extra_config_overrides: Optional[List[str]] = None,
 ) -> ReviewResult:
-    client = await AppServerClient.start(codex_bin, profile=profile)
+    client = await AppServerClient.start(
+        codex_bin,
+        profile=profile,
+        extra_config_overrides=extra_config_overrides,
+    )
     try:
         await client.initialize()
         return await run_single_review(
@@ -563,6 +606,7 @@ async def run_review_process(
             model=model,
             model_provider=model_provider,
             additional_developer_instructions=additional_developer_instructions,
+            review_mode=review_mode,
         )
     finally:
         await client.close()
@@ -577,6 +621,8 @@ async def run_reviews_processes(
     model_provider: Optional[str] = None,
     profile: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
+    review_mode: str = "uncommitted",
+    extra_config_overrides: Optional[List[str]] = None,
 ) -> List[ReviewResult]:
     tasks = [
         asyncio.create_task(
@@ -588,6 +634,8 @@ async def run_reviews_processes(
                 model_provider=model_provider,
                 profile=profile,
                 additional_developer_instructions=additional_developer_instructions,
+                review_mode=review_mode,
+                extra_config_overrides=extra_config_overrides,
             )
         )
         for _ in range(parallelism)
@@ -605,6 +653,8 @@ async def run_reviews(
     model_provider: Optional[str] = None,
     profile: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
+    review_mode: str = "uncommitted",
+    extra_config_overrides: Optional[List[str]] = None,
 ) -> List[ReviewResult]:
     global _PREFER_PROCESS_MODE
 
@@ -620,6 +670,8 @@ async def run_reviews(
                 model_provider=model_provider,
                 profile=profile,
                 additional_developer_instructions=additional_developer_instructions,
+                review_mode=review_mode,
+                extra_config_overrides=extra_config_overrides,
             )
         except asyncio.CancelledError:
             raise
@@ -635,6 +687,8 @@ async def run_reviews(
                 model_provider=model_provider,
                 profile=profile,
                 additional_developer_instructions=additional_developer_instructions,
+                review_mode=review_mode,
+                extra_config_overrides=extra_config_overrides,
             )
             _PREFER_PROCESS_MODE = True
             return process_results
@@ -651,6 +705,8 @@ async def run_reviews(
                 model_provider=model_provider,
                 profile=profile,
                 additional_developer_instructions=additional_developer_instructions,
+                review_mode=review_mode,
+                extra_config_overrides=extra_config_overrides,
             )
         except asyncio.CancelledError:
             raise
