@@ -22,6 +22,11 @@ model = "gpt-5.5"
 model_reasoning_effort = "medium"
 ```
 
+When the MCP server is started with `--profile review`, it reads this profile from
+Codex config and applies supported review settings itself. Supported profile keys
+are `model`, `model_provider`, `service_tier`, `model_reasoning_effort`, and
+`model_reasoning_summary`.
+
 AGENTS.md example instruction:
 
 ```text

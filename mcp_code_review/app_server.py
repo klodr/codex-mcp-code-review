@@ -2,8 +2,10 @@ import asyncio
 import contextlib
 import json
 import os
+import tomllib
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from mcp_code_review.review import ReviewResult, parse_review_output
@@ -34,6 +36,15 @@ BANNED_APP_SERVER_FEATURES = (
 )
 MCP_DISABLED_ERROR_TEXT = "spawned codex attempted MCP tool call; MCP servers must stay disabled"
 _PREFER_PROCESS_MODE = False
+
+
+@dataclass(frozen=True)
+class CodexReviewProfile:
+    model: Optional[str] = None
+    model_provider: Optional[str] = None
+    service_tier: Optional[str] = None
+    model_reasoning_effort: Optional[str] = None
+    model_reasoning_summary: Optional[str] = None
 
 
 def is_concurrency_error(message: str) -> bool:
@@ -81,6 +92,86 @@ def build_disabled_feature_assignments(features: tuple[str, ...]) -> List[str]:
     return [f"features.{feature}=false" for feature in features]
 
 
+def codex_config_path(env: Optional[Dict[str, str]] = None) -> Path:
+    environment = env if env is not None else os.environ
+    codex_home = environment.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home) / "config.toml"
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _profile_string(
+    payload: Dict[str, Any],
+    key: str,
+    profile: str,
+    config_path: Path,
+) -> Optional[str]:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AppServerError(
+            f"Codex profile {profile!r} field {key!r} in {config_path} must be a string"
+        )
+    return value
+
+
+def load_codex_review_profile(
+    profile: Optional[str],
+    env: Optional[Dict[str, str]] = None,
+) -> CodexReviewProfile:
+    if profile is None:
+        return CodexReviewProfile()
+
+    config_path = codex_config_path(env)
+    try:
+        with config_path.open("rb") as config_file:
+            config = tomllib.load(config_file)
+    except FileNotFoundError as exc:
+        raise AppServerError(
+            f"Codex profile {profile!r} requested but config file was not found at {config_path}"
+        ) from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise AppServerError(f"failed to parse Codex config at {config_path}: {exc}") from exc
+
+    profiles = config.get("profiles")
+    if not isinstance(profiles, dict):
+        raise AppServerError(f"Codex profile {profile!r} not found in {config_path}")
+
+    profile_payload = profiles.get(profile)
+    if not isinstance(profile_payload, dict):
+        raise AppServerError(f"Codex profile {profile!r} not found in {config_path}")
+
+    return CodexReviewProfile(
+        model=_profile_string(profile_payload, "model", profile, config_path),
+        model_provider=_profile_string(profile_payload, "model_provider", profile, config_path),
+        service_tier=_profile_string(profile_payload, "service_tier", profile, config_path),
+        model_reasoning_effort=_profile_string(
+            profile_payload,
+            "model_reasoning_effort",
+            profile,
+            config_path,
+        ),
+        model_reasoning_summary=_profile_string(
+            profile_payload,
+            "model_reasoning_summary",
+            profile,
+            config_path,
+        ),
+    )
+
+
+def profile_config_assignments(profile: CodexReviewProfile) -> List[str]:
+    assignments: List[str] = []
+    if profile.model_reasoning_effort:
+        assignments.append(f"model_reasoning_effort={json.dumps(profile.model_reasoning_effort)}")
+    if profile.model_reasoning_summary:
+        assignments.append(
+            f"model_reasoning_summary={json.dumps(profile.model_reasoning_summary)}"
+        )
+    return assignments
+
+
 def parse_mcp_server_names(raw_json: str) -> List[str]:
     try:
         payload = json.loads(raw_json)
@@ -103,13 +194,9 @@ def parse_mcp_server_names(raw_json: str) -> List[str]:
 
 async def _list_mcp_server_names_once(
     codex_bin: str,
-    profile: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
 ) -> List[str]:
-    command = [codex_bin]
-    if profile:
-        command.extend(["-c", f"profile={profile}"])
-    command.extend(["mcp", "list", "--json"])
+    command = [codex_bin, "mcp", "list", "--json"]
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -131,13 +218,12 @@ async def _list_mcp_server_names_once(
 
 async def list_mcp_server_names_with_retry(
     codex_bin: str,
-    profile: Optional[str] = None,
     env: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     last_error: Optional[AppServerError] = None
     for _ in range(MCP_SERVER_LIST_ATTEMPTS):
         try:
-            return await _list_mcp_server_names_once(codex_bin, profile=profile, env=env)
+            return await _list_mcp_server_names_once(codex_bin, env=env)
         except AppServerError as exc:
             last_error = exc
     raise AppServerError(
@@ -147,12 +233,12 @@ async def list_mcp_server_names_with_retry(
 
 def build_app_server_command(
     codex_bin: str,
-    profile: Optional[str],
     mcp_server_names: List[str],
+    config_assignments: Optional[List[str]] = None,
 ) -> List[str]:
     command = [codex_bin]
-    if profile:
-        command.extend(["-c", f"profile={profile}"])
+    for assignment in config_assignments or []:
+        command.extend(["-c", assignment])
     for assignment in build_disabled_feature_assignments(BANNED_APP_SERVER_FEATURES):
         command.extend(["-c", assignment])
     command.extend(["-c", SPAWN_GUARD_CONFIG_ASSIGNMENT])
@@ -258,10 +344,14 @@ class AppServerClient:
         cls,
         codex_bin: str,
         env: Optional[Dict[str, str]] = None,
-        profile: Optional[str] = None,
+        config_assignments: Optional[List[str]] = None,
     ) -> "AppServerClient":
-        mcp_server_names = await list_mcp_server_names_with_retry(codex_bin, profile=profile, env=env)
-        cmd = build_app_server_command(codex_bin, profile, mcp_server_names)
+        mcp_server_names = await list_mcp_server_names_with_retry(codex_bin, env=env)
+        cmd = build_app_server_command(
+            codex_bin,
+            mcp_server_names,
+            config_assignments=config_assignments,
+        )
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -440,6 +530,7 @@ async def run_single_review(
     timeout_seconds: int,
     model: Optional[str] = None,
     model_provider: Optional[str] = None,
+    service_tier: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
 ) -> ReviewResult:
     thread_params: Dict[str, Any] = {
@@ -451,6 +542,8 @@ async def run_single_review(
         thread_params["model"] = model
     if model_provider:
         thread_params["modelProvider"] = model_provider
+    if service_tier:
+        thread_params["serviceTier"] = service_tier
 
     thread_response = await client.request("thread/start", thread_params)
     thread = (thread_response or {}).get("thread", {})
@@ -507,8 +600,15 @@ async def run_reviews_threads(
     model_provider: Optional[str] = None,
     profile: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
+    profile_settings: Optional[CodexReviewProfile] = None,
 ) -> List[ReviewResult]:
-    client = await AppServerClient.start(codex_bin, profile=profile)
+    settings = (
+        profile_settings if profile_settings is not None else load_codex_review_profile(profile)
+    )
+    client = await AppServerClient.start(
+        codex_bin,
+        config_assignments=profile_config_assignments(settings),
+    )
     try:
         await client.initialize()
         tasks = [
@@ -517,8 +617,11 @@ async def run_reviews_threads(
                     client,
                     cwd,
                     timeout_seconds,
-                    model=model,
-                    model_provider=model_provider,
+                    model=model if model is not None else settings.model,
+                    model_provider=model_provider
+                    if model_provider is not None
+                    else settings.model_provider,
+                    service_tier=settings.service_tier,
                     additional_developer_instructions=additional_developer_instructions,
                 )
             )
@@ -538,7 +641,9 @@ async def run_reviews_threads(
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            raise ConcurrencyNotSupported("app-server concurrency not supported") from concurrency_error
+            raise ConcurrencyNotSupported(
+                "app-server concurrency not supported"
+            ) from concurrency_error
         return results
     finally:
         await client.close()
@@ -552,16 +657,26 @@ async def run_review_process(
     model_provider: Optional[str] = None,
     profile: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
+    profile_settings: Optional[CodexReviewProfile] = None,
 ) -> ReviewResult:
-    client = await AppServerClient.start(codex_bin, profile=profile)
+    settings = (
+        profile_settings if profile_settings is not None else load_codex_review_profile(profile)
+    )
+    client = await AppServerClient.start(
+        codex_bin,
+        config_assignments=profile_config_assignments(settings),
+    )
     try:
         await client.initialize()
         return await run_single_review(
             client,
             cwd,
             timeout_seconds,
-            model=model,
-            model_provider=model_provider,
+            model=model if model is not None else settings.model,
+            model_provider=model_provider
+            if model_provider is not None
+            else settings.model_provider,
+            service_tier=settings.service_tier,
             additional_developer_instructions=additional_developer_instructions,
         )
     finally:
@@ -577,7 +692,11 @@ async def run_reviews_processes(
     model_provider: Optional[str] = None,
     profile: Optional[str] = None,
     additional_developer_instructions: Optional[str] = None,
+    profile_settings: Optional[CodexReviewProfile] = None,
 ) -> List[ReviewResult]:
+    settings = (
+        profile_settings if profile_settings is not None else load_codex_review_profile(profile)
+    )
     tasks = [
         asyncio.create_task(
             run_review_process(
@@ -588,6 +707,7 @@ async def run_reviews_processes(
                 model_provider=model_provider,
                 profile=profile,
                 additional_developer_instructions=additional_developer_instructions,
+                profile_settings=settings,
             )
         )
         for _ in range(parallelism)
@@ -607,6 +727,7 @@ async def run_reviews(
     additional_developer_instructions: Optional[str] = None,
 ) -> List[ReviewResult]:
     global _PREFER_PROCESS_MODE
+    profile_settings = load_codex_review_profile(profile)
 
     async def run_with_thread_fallback() -> List[ReviewResult]:
         global _PREFER_PROCESS_MODE
@@ -620,6 +741,7 @@ async def run_reviews(
                 model_provider=model_provider,
                 profile=profile,
                 additional_developer_instructions=additional_developer_instructions,
+                profile_settings=profile_settings,
             )
         except asyncio.CancelledError:
             raise
@@ -635,6 +757,7 @@ async def run_reviews(
                 model_provider=model_provider,
                 profile=profile,
                 additional_developer_instructions=additional_developer_instructions,
+                profile_settings=profile_settings,
             )
             _PREFER_PROCESS_MODE = True
             return process_results
@@ -651,6 +774,7 @@ async def run_reviews(
                 model_provider=model_provider,
                 profile=profile,
                 additional_developer_instructions=additional_developer_instructions,
+                profile_settings=profile_settings,
             )
         except asyncio.CancelledError:
             raise
@@ -680,6 +804,7 @@ async def run_reviews(
             model_provider=model_provider,
             profile=profile,
             additional_developer_instructions=additional_developer_instructions,
+            profile_settings=profile_settings,
         )
     if concurrency_mode != "auto":
         raise ValueError(f"unsupported concurrency mode: {concurrency_mode}")
