@@ -15,12 +15,12 @@ class TestSeveritySummary(unittest.TestCase):
             ReviewResult(
                 verdict="comment",
                 summary="first",
-                comment_markdown="- [P1] one\n- [P2] two\n- [P2] dup",
+                comment_markdown="- [P1] one\n- [P1] two\n- [P1] three\n- [P2] four",
             ),
             ReviewResult(
                 verdict="comment",
                 summary="second",
-                comment_markdown="notes [p1] again",
+                comment_markdown="notes [p3]",
             ),
             ReviewResult(
                 verdict="pass",
@@ -28,7 +28,7 @@ class TestSeveritySummary(unittest.TestCase):
                 comment_markdown="- [P0] ignored",
             ),
         ]
-        self.assertEqual(format_severity_summary(results), " (P0=1, P1=2, P2=1)")
+        self.assertEqual(format_severity_summary(results), " (P0=1, P1=3, P2=1, P3=1)")
 
     def test_format_severity_summary_empty(self):
         results = [ReviewResult(verdict="comment", summary="x", comment_markdown="no tags")]

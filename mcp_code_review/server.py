@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from mcp_code_review.app_server import resolve_cwd, run_reviews
-from mcp_code_review.review import ReviewResult, extract_severity_tags
+from mcp_code_review.review import (
+    ReviewResult,
+    extract_severity_tag_occurrences,
+    extract_severity_tags,
+)
 from mcp_code_review.spawn_guard import find_guarded_app_server_ancestor_cmdline
 
 
@@ -187,7 +191,7 @@ def count_tagged_issue_runs(results: list[ReviewResult]) -> int:
 def format_severity_summary(results: list[ReviewResult]) -> str:
     counts: Counter[str] = Counter()
     for result in results:
-        for tag in extract_severity_tags(result.comment_markdown):
+        for tag in extract_severity_tag_occurrences(result.comment_markdown):
             counts[tag] += 1
     if not counts:
         return ""

@@ -15,15 +15,20 @@ class ReviewResult:
 SEVERITY_TAG_PATTERN = re.compile(r"\[P(\d+)\]", re.IGNORECASE)
 
 
-def extract_severity_tags(text: str) -> list[str]:
+def extract_severity_tag_occurrences(text: str) -> list[str]:
     if not text:
         return []
-    severities: set[int] = set()
+    severities: list[int] = []
     for match in SEVERITY_TAG_PATTERN.finditer(text):
         try:
-            severities.add(int(match.group(1)))
+            severities.append(int(match.group(1)))
         except ValueError:
             continue
+    return [f"P{severity}" for severity in severities]
+
+
+def extract_severity_tags(text: str) -> list[str]:
+    severities = {int(tag[1:]) for tag in extract_severity_tag_occurrences(text)}
     return [f"P{severity}" for severity in sorted(severities)]
 
 
