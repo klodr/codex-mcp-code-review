@@ -63,6 +63,14 @@ class TestSeveritySummary(unittest.TestCase):
             "completed 1 review(s); 0 run(s) reported tagged issues; took 12s",
         )
 
+    def test_format_completion_summary_appends_archive_failure_suffix(self):
+        summary = format_completion_summary(1, 0, "", 12, archive_failed=True)
+        self.assertEqual(
+            summary,
+            "completed 1 review(s); 0 run(s) reported tagged issues; took 12s. "
+            "thread archive failed",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

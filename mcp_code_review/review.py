@@ -9,6 +9,7 @@ class ReviewResult:
     verdict: str
     summary: str
     comment_markdown: str
+    archive_failed: bool = False
 
 
 SEVERITY_TAG_PATTERN = re.compile(r"\[P(\d+)\]", re.IGNORECASE)

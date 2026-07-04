@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -7,9 +8,12 @@ from unittest.mock import patch
 from mcp_code_review.app_server import (
     AppServerError,
     BANNED_APP_SERVER_FEATURES,
+    AppServerClient,
     CodexReviewProfile,
     MCP_DISABLED_ERROR_TEXT,
     MCP_SERVER_LIST_ATTEMPTS,
+    _list_mcp_server_names_once,
+    best_effort_archive_thread,
     build_app_server_command,
     is_mcp_tool_call_notification,
     list_mcp_server_names_with_retry,
@@ -63,6 +67,7 @@ class TestAppServerSpawnConfig(unittest.TestCase):
                 "multi_agent",
                 "multi_agent_v2",
                 "memory_tool",
+                "plugins",
                 "spawn_csv",
                 "enable_fanout",
             ),
@@ -95,6 +100,59 @@ class TestAppServerSpawnConfig(unittest.TestCase):
 
 
 class TestMcpServerNameRetry(unittest.IsolatedAsyncioTestCase):
+    async def test_list_mcp_server_names_once_builds_configured_command(self):
+        captured_command = None
+
+        class Process:
+            returncode = 0
+
+            async def communicate(self):
+                return b'[{"name": "review"}]', b""
+
+        async def create_subprocess_exec(*command, **_kwargs):
+            nonlocal captured_command
+            captured_command = command
+            return Process()
+
+        with patch("asyncio.create_subprocess_exec", create_subprocess_exec):
+            names = await _list_mcp_server_names_once(
+                "codex",
+                config_assignments=["features.plugins=false"],
+            )
+
+        self.assertEqual(names, ["review"])
+        self.assertEqual(
+            captured_command,
+            (
+                "codex",
+                "-c",
+                "features.plugins=false",
+                "mcp",
+                "list",
+                "--json",
+            ),
+        )
+
+    async def test_list_mcp_server_names_applies_config_assignments(self):
+        list_once = AsyncMock(return_value=["review"])
+        config_assignments = [
+            'model_reasoning_effort="xhigh"',
+            "features.plugins=false",
+        ]
+
+        with patch("mcp_code_review.app_server._list_mcp_server_names_once", list_once):
+            names = await list_mcp_server_names_with_retry(
+                "codex",
+                config_assignments=config_assignments,
+            )
+
+        self.assertEqual(names, ["review"])
+        list_once.assert_awaited_once_with(
+            "codex",
+            env=None,
+            config_assignments=config_assignments,
+        )
+
     async def test_list_mcp_server_names_retries_once(self):
         list_once = AsyncMock(side_effect=[AppServerError("transient"), ["review"]])
         with patch("mcp_code_review.app_server._list_mcp_server_names_once", list_once):
@@ -436,21 +494,45 @@ class TestRunReviewsFallback(unittest.IsolatedAsyncioTestCase):
 
 
 class _RecordingClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        review_thread_id: str = "thread-1",
+        fail_archive: bool = False,
+        complete_review: bool = True,
+    ) -> None:
         self.requests = []
+        self.review_thread_id = review_thread_id
+        self.fail_archive = fail_archive
+        self.complete_review = complete_review
 
     async def request(self, method, params=None):
         self.requests.append((method, params))
         if method == "thread/start":
             return {"thread": {"id": "thread-1"}}
         if method == "review/start":
-            return {"turn": {"id": "turn-1"}, "reviewThreadId": "thread-1"}
+            return {"turn": {"id": "turn-1"}, "reviewThreadId": self.review_thread_id}
+        if method == "thread/archive":
+            if self.fail_archive:
+                raise AppServerError("archive failed")
+            return {}
         raise AssertionError(f"unexpected method: {method}")
 
     def add_tracker(self, tracker):
-        tracker.future.set_result(
-            '{"verdict":"pass","summary":"ok","comment_markdown":""}'
-        )
+        if self.complete_review:
+            tracker.future.set_result(
+                '{"verdict":"pass","summary":"ok","comment_markdown":""}'
+            )
+
+
+class _StallingArchiveClient:
+    async def request(self, method, params=None):
+        await asyncio.sleep(3600)
+
+
+class _ClosedStdout:
+    async def read(self, _size):
+        return b""
 
 
 class TestRunSingleReview(unittest.IsolatedAsyncioTestCase):
@@ -490,6 +572,80 @@ class TestRunSingleReview(unittest.IsolatedAsyncioTestCase):
         review_start_payload = client.requests[1][1]
         self.assertEqual(review_start_payload["delivery"], "inline")
         self.assertEqual(review_start_payload["target"], {"type": "uncommittedChanges"})
+        self.assertEqual(client.requests[2][0], "thread/archive")
+        self.assertEqual(client.requests[2][1], {"threadId": "thread-1"})
+
+    async def test_archive_uses_review_thread_id(self):
+        client = _RecordingClient(review_thread_id="review-thread-1")
+
+        await run_single_review(
+            client,
+            cwd="/tmp/project",
+            timeout_seconds=5,
+        )
+
+        self.assertEqual(client.requests[2], ("thread/archive", {"threadId": "review-thread-1"}))
+
+    async def test_archive_failure_marks_result_without_failing_review(self):
+        client = _RecordingClient(fail_archive=True)
+
+        result = await run_single_review(
+            client,
+            cwd="/tmp/project",
+            timeout_seconds=5,
+        )
+
+        self.assertEqual(result.verdict, "pass")
+        self.assertTrue(result.archive_failed)
+
+    async def test_timeout_attempts_archive_and_preserves_timeout_error(self):
+        client = _RecordingClient(complete_review=False)
+
+        with self.assertRaisesRegex(AppServerError, "timed out"):
+            await run_single_review(
+                client,
+                cwd="/tmp/project",
+                timeout_seconds=0,
+            )
+
+        self.assertEqual(client.requests[2], ("thread/archive", {"threadId": "thread-1"}))
+
+    async def test_archive_helper_times_out_stalled_archive_request(self):
+        archived = await best_effort_archive_thread(
+            _StallingArchiveClient(),
+            "thread-1",
+            timeout_seconds=0,
+        )
+
+        self.assertFalse(archived)
+
+    async def test_handle_response_ignores_cancelled_pending_request(self):
+        client = object.__new__(AppServerClient)
+        future = asyncio.get_running_loop().create_future()
+        future.cancel()
+        client._pending = {"request-1": future}
+
+        await AppServerClient._handle_response(
+            client,
+            {"id": "request-1", "result": {}},
+        )
+
+        self.assertEqual(client._pending, {})
+
+    async def test_reader_loop_reports_stderr_when_stdout_closes(self):
+        client = object.__new__(AppServerClient)
+        future = asyncio.get_running_loop().create_future()
+        client._stdout = _ClosedStdout()
+        client._pending = {"request-1": future}
+        client._trackers = []
+        client._buffer = bytearray()
+        client._stderr_buffer = bytearray(b"Error: invalid transport\n")
+        client._stderr_task = None
+
+        await AppServerClient._reader_loop(client)
+
+        with self.assertRaisesRegex(AppServerError, "invalid transport"):
+            future.result()
 
     async def test_review_start_uses_custom_prompt_with_extra_instructions(self):
         client = _RecordingClient()

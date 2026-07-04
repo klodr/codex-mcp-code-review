@@ -4,7 +4,7 @@ import json
 import os
 import tomllib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -31,10 +31,14 @@ BANNED_APP_SERVER_FEATURES = (
     "multi_agent",
     "multi_agent_v2",
     "memory_tool",
+    "plugins",
     "spawn_csv",
     "enable_fanout",
 )
 MCP_DISABLED_ERROR_TEXT = "spawned codex attempted MCP tool call; MCP servers must stay disabled"
+ARCHIVE_REQUEST_TIMEOUT_SECONDS = 2
+APP_SERVER_STDERR_DRAIN_TIMEOUT_SECONDS = 0.2
+MAX_APP_SERVER_STDERR_BYTES = 64 * 1024
 _PREFER_PROCESS_MODE = False
 
 
@@ -88,8 +92,31 @@ def timeout_error(timeout_seconds: int) -> AppServerError:
     return AppServerError(f"codex review timed out after {timeout_seconds}s")
 
 
+async def best_effort_archive_thread(
+    client: "AppServerClient",
+    thread_id: str,
+    timeout_seconds: float = ARCHIVE_REQUEST_TIMEOUT_SECONDS,
+) -> bool:
+    try:
+        await asyncio.wait_for(
+            client.request("thread/archive", {"threadId": thread_id}),
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        return False
+    return True
+
+
 def build_disabled_feature_assignments(features: tuple[str, ...]) -> List[str]:
     return [f"features.{feature}=false" for feature in features]
+
+
+def build_app_server_config_assignments(
+    config_assignments: Optional[List[str]] = None,
+) -> List[str]:
+    return list(config_assignments or []) + build_disabled_feature_assignments(
+        BANNED_APP_SERVER_FEATURES
+    )
 
 
 def codex_config_path(env: Optional[Dict[str, str]] = None) -> Path:
@@ -195,8 +222,12 @@ def parse_mcp_server_names(raw_json: str) -> List[str]:
 async def _list_mcp_server_names_once(
     codex_bin: str,
     env: Optional[Dict[str, str]] = None,
+    config_assignments: Optional[List[str]] = None,
 ) -> List[str]:
-    command = [codex_bin, "mcp", "list", "--json"]
+    command = [codex_bin]
+    for assignment in config_assignments or []:
+        command.extend(["-c", assignment])
+    command.extend(["mcp", "list", "--json"])
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -219,11 +250,16 @@ async def _list_mcp_server_names_once(
 async def list_mcp_server_names_with_retry(
     codex_bin: str,
     env: Optional[Dict[str, str]] = None,
+    config_assignments: Optional[List[str]] = None,
 ) -> List[str]:
     last_error: Optional[AppServerError] = None
     for _ in range(MCP_SERVER_LIST_ATTEMPTS):
         try:
-            return await _list_mcp_server_names_once(codex_bin, env=env)
+            return await _list_mcp_server_names_once(
+                codex_bin,
+                env=env,
+                config_assignments=config_assignments,
+            )
         except AppServerError as exc:
             last_error = exc
     raise AppServerError(
@@ -237,9 +273,7 @@ def build_app_server_command(
     config_assignments: Optional[List[str]] = None,
 ) -> List[str]:
     command = [codex_bin]
-    for assignment in config_assignments or []:
-        command.extend(["-c", assignment])
-    for assignment in build_disabled_feature_assignments(BANNED_APP_SERVER_FEATURES):
+    for assignment in build_app_server_config_assignments(config_assignments):
         command.extend(["-c", assignment])
     command.extend(["-c", SPAWN_GUARD_CONFIG_ASSIGNMENT])
     for name in mcp_server_names:
@@ -334,6 +368,11 @@ class AppServerClient:
         self._pending: Dict[str, asyncio.Future] = {}
         self._trackers: List[ReviewTracker] = []
         self._buffer = bytearray()
+        self._stderr = process.stderr
+        self._stderr_buffer = bytearray()
+        self._stderr_task = (
+            asyncio.create_task(self._stderr_loop()) if self._stderr is not None else None
+        )
         self._write_lock = asyncio.Lock()
         self._closed = asyncio.Event()
         self._mcp_violation_error: Optional[AppServerError] = None
@@ -346,7 +385,14 @@ class AppServerClient:
         env: Optional[Dict[str, str]] = None,
         config_assignments: Optional[List[str]] = None,
     ) -> "AppServerClient":
-        mcp_server_names = await list_mcp_server_names_with_retry(codex_bin, env=env)
+        app_server_config_assignments = build_app_server_config_assignments(
+            config_assignments
+        )
+        mcp_server_names = await list_mcp_server_names_with_retry(
+            codex_bin,
+            env=env,
+            config_assignments=app_server_config_assignments,
+        )
         cmd = build_app_server_command(
             codex_bin,
             mcp_server_names,
@@ -356,7 +402,7 @@ class AppServerClient:
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=None,
+            stderr=asyncio.subprocess.PIPE,
             env=env,
         )
         if process.stdin is None or process.stdout is None:
@@ -385,6 +431,10 @@ class AppServerClient:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._reader_task
+        if self._stderr_task:
+            self._stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._stderr_task
         if self._process.returncode is None:
             self._process.terminate()
             try:
@@ -429,6 +479,34 @@ class AppServerClient:
             self._stdin.write(b"\n")
             await self._stdin.drain()
 
+    async def _stderr_loop(self) -> None:
+        assert self._stderr is not None
+        while True:
+            chunk = await self._stderr.read(65536)
+            if not chunk:
+                break
+            self._stderr_buffer.extend(chunk)
+            overflow = len(self._stderr_buffer) - MAX_APP_SERVER_STDERR_BYTES
+            if overflow > 0:
+                del self._stderr_buffer[:overflow]
+
+    async def _wait_for_stderr(self) -> None:
+        stderr_task = getattr(self, "_stderr_task", None)
+        if stderr_task is None or stderr_task.done():
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                asyncio.shield(stderr_task),
+                timeout=APP_SERVER_STDERR_DRAIN_TIMEOUT_SECONDS,
+            )
+
+    def _closed_stdout_error(self) -> AppServerError:
+        stderr_buffer = getattr(self, "_stderr_buffer", bytearray())
+        stderr_text = bytes(stderr_buffer).decode("utf-8", errors="ignore").strip()
+        if stderr_text:
+            return AppServerError(f"codex app-server closed stdout: {stderr_text}")
+        return AppServerError("codex app-server closed stdout")
+
     async def _reader_loop(self) -> None:
         assert self._stdout is not None
         try:
@@ -460,7 +538,8 @@ class AppServerClient:
                     if "method" in message:
                         self._dispatch_notification(message)
         finally:
-            error = AppServerError("codex app-server closed stdout")
+            await self._wait_for_stderr()
+            error = self._closed_stdout_error()
             for future in self._pending.values():
                 if not future.done():
                     future.set_exception(error)
@@ -492,6 +571,8 @@ class AppServerClient:
         request_id = str(message.get("id"))
         future = self._pending.pop(request_id, None)
         if future is None:
+            return
+        if future.done():
             return
         if "error" in message:
             future.set_exception(AppServerError(str(message["error"])))
@@ -587,8 +668,15 @@ async def run_single_review(
     try:
         review_text = await asyncio.wait_for(tracker.future, timeout=timeout_seconds)
     except asyncio.TimeoutError as exc:
+        await best_effort_archive_thread(client, review_thread_id)
         raise timeout_error(timeout_seconds) from exc
-    return parse_review_output(review_text)
+    except Exception:
+        await best_effort_archive_thread(client, review_thread_id)
+        raise
+    result = parse_review_output(review_text)
+    if not await best_effort_archive_thread(client, review_thread_id):
+        result = replace(result, archive_failed=True)
+    return result
 
 
 async def run_reviews_threads(

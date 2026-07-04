@@ -214,12 +214,16 @@ def format_completion_summary(
     issue_runs: int,
     severity_summary: str,
     elapsed_seconds: float,
+    archive_failed: bool = False,
 ) -> str:
     elapsed_text = format_elapsed_time(elapsed_seconds)
-    return (
+    summary = (
         f"completed {review_count} review(s); {issue_runs} run(s) reported tagged issues"
         f"{severity_summary}; took {elapsed_text}"
     )
+    if archive_failed:
+        summary += ". thread archive failed"
+    return summary
 
 
 def request_id_key(request_id: Any) -> str:
@@ -323,6 +327,7 @@ async def handle_tool_call(
         issues,
         severity_summary,
         elapsed_seconds,
+        archive_failed=any(result.archive_failed for result in results),
     )
     return jsonrpc_response(
         request_id,

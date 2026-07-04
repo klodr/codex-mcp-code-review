@@ -79,6 +79,12 @@ class TestServerArguments(unittest.TestCase):
             "string",
         )
 
+    def test_tool_definition_output_schema_has_no_warnings_field(self):
+        schema = tool_definition(make_config())["outputSchema"]
+
+        self.assertEqual(schema["required"], ["results"])
+        self.assertNotIn("warnings", schema["properties"])
+
     def test_parse_args_enables_additional_review_instructions_by_default(self):
         config = parse_args([])
 
