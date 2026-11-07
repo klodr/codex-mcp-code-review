@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import AsyncMock
 from unittest.mock import patch
@@ -20,6 +21,7 @@ from mcp_code_review.app_server import (
     ensure_review_permission_profile,
     is_mcp_tool_call_notification,
     resolve_git_common_dir,
+    resolve_git_paths,
     resolve_global_excludes_file,
     list_mcp_server_names_with_retry,
     parse_mcp_server_names,
@@ -146,6 +148,23 @@ class TestAppServerSpawnConfig(unittest.TestCase):
         self.assertEqual(policy["/repo/.git"], "read")
         self.assertEqual(policy["/home/u/.config/git/ignore"], "read")
 
+    def test_permission_assignment_parses_as_toml_with_unusual_paths(self):
+        odd = '/home/u/dossier \U0001F600 "cité" \\ tab\there/.config/git/ignore'
+        assignment = build_review_permission_assignments([], [odd])[1]
+        key, _, value = assignment.partition("=")
+        parsed = tomllib.loads(f"x = {value}")["x"]
+        self.assertEqual(parsed[odd], "read")
+        self.assertEqual(parsed[":project_roots"], "read")
+        self.assertTrue(key.endswith(".filesystem"))
+
+    def test_app_server_env_declares_safe_directories(self):
+        env = build_app_server_env({}, excludes_file="/h/ignore", safe_directories=["/r", "/m", "/r"])
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]), ("core.excludesFile", "/h/ignore"))
+        self.assertEqual((env["GIT_CONFIG_KEY_1"], env["GIT_CONFIG_VALUE_1"]), ("safe.directory", "/r"))
+        self.assertEqual((env["GIT_CONFIG_KEY_2"], env["GIT_CONFIG_VALUE_2"]), ("safe.directory", "/m"))
+        self.assertNotIn("GIT_CONFIG_KEY_3", env)
+
     def test_ensure_review_permission_profile(self):
         ensure_review_permission_profile({"activePermissionProfile": {"id": REVIEW_PERMISSION_PROFILE}})
         for response in (None, {}, {"activePermissionProfile": {"id": ":read-only"}}, {"activePermissionProfile": "x"}):
@@ -183,6 +202,11 @@ class TestGitPathsForReview(unittest.TestCase):
             _git("commit", "-q", "-m", "init", cwd=main)
             _git("worktree", "add", "-q", linked, cwd=main)
             env = dict(os.environ)
+            self.assertEqual(resolve_git_paths(main, env), (os.path.realpath(main), None))
+            self.assertEqual(
+                resolve_git_paths(linked, env),
+                (os.path.realpath(linked), os.path.realpath(os.path.join(main, ".git"))),
+            )
             self.assertIsNone(resolve_git_common_dir(main, env))
             self.assertEqual(
                 resolve_git_common_dir(linked, env), os.path.realpath(os.path.join(main, ".git"))

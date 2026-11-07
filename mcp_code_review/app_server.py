@@ -90,18 +90,30 @@ def resolve_global_excludes_file(env: Dict[str, str]) -> Optional[str]:
     return path if os.path.isfile(path) else None
 
 
-def resolve_git_common_dir(cwd: Optional[str], env: Dict[str, str]) -> Optional[str]:
-    """Git metadata of a linked worktree lives in the main repository, outside `cwd`."""
+def resolve_git_paths(cwd: Optional[str], env: Dict[str, str]) -> tuple[Optional[str], Optional[str]]:
+    """(worktree top level, git common dir when it lies outside it), resolved with the user's env.
+
+    The metadata of a linked worktree lives in the main repository, outside `cwd`.
+    A top level resolved here means the user's own git trusts the repository
+    (ownership or `safe.directory`), a decision the isolated env must keep.
+    """
     if not cwd:
-        return None
-    common_dir = _git_output(["rev-parse", "--path-format=absolute", "--git-common-dir"], env, cwd=cwd)
+        return None, None
     toplevel = _git_output(["rev-parse", "--show-toplevel"], env, cwd=cwd)
-    if common_dir is None or toplevel is None:
-        return None
+    common_dir = _git_output(["rev-parse", "--path-format=absolute", "--git-common-dir"], env, cwd=cwd)
+    if toplevel is None:
+        return None, None
+    toplevel = os.path.realpath(toplevel)
+    if common_dir is None:
+        return toplevel, None
     common_dir = os.path.realpath(common_dir)
-    if common_dir == os.path.realpath(toplevel) or common_dir.startswith(os.path.realpath(toplevel) + os.sep):
-        return None  # Already inside :project_roots.
-    return common_dir
+    if common_dir == toplevel or common_dir.startswith(toplevel + os.sep):
+        return toplevel, None  # Already inside :project_roots.
+    return toplevel, common_dir
+
+
+def resolve_git_common_dir(cwd: Optional[str], env: Dict[str, str]) -> Optional[str]:
+    return resolve_git_paths(cwd, env)[1]
 
 
 def build_review_filesystem_policy(
@@ -118,9 +130,22 @@ def build_review_filesystem_policy(
     return policy
 
 
+def _toml_basic_string(value: str) -> str:
+    # Not json.dumps: it escapes non-BMP characters as surrogate pairs, invalid in TOML.
+    out = []
+    for char in value:
+        code = ord(char)
+        if char in ('"', "\\"):
+            out.append("\\" + char)
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{code:04X}")
+        else:
+            out.append(char)
+    return '"' + "".join(out) + '"'
+
+
 def _toml_inline_table(entries: Dict[str, str]) -> str:
-    # JSON string literals are valid TOML basic strings for these keys and values.
-    return "{" + ",".join(f"{json.dumps(key)}={json.dumps(value)}" for key, value in entries.items()) + "}"
+    return "{" + ",".join(f"{_toml_basic_string(key)}={_toml_basic_string(value)}" for key, value in entries.items()) + "}"
 
 
 def build_review_permission_assignments(
@@ -139,20 +164,24 @@ def build_review_permission_assignments(
 def build_app_server_env(
     base: Optional[Dict[str, str]] = None,
     excludes_file: Optional[str] = None,
+    safe_directories: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     env = dict(os.environ if base is None else base)
     env.update(GIT_ISOLATION_ENV)
     for key in [k for k in env if k.startswith("GIT_CONFIG_KEY_") or k.startswith("GIT_CONFIG_VALUE_")]:
         del env[key]
     env.pop("GIT_CONFIG_COUNT", None)
+    entries: List[tuple[str, str]] = []
     if excludes_file:
-        env.update(
-            {
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "core.excludesFile",
-                "GIT_CONFIG_VALUE_0": excludes_file,
-            }
-        )
+        entries.append(("core.excludesFile", excludes_file))
+    # Command-scope config (GIT_CONFIG_COUNT) is "protected": git honours safe.directory there.
+    for directory in dict.fromkeys(safe_directories or []):
+        entries.append(("safe.directory", directory))
+    if entries:
+        env["GIT_CONFIG_COUNT"] = str(len(entries))
+        for index, (key, value) in enumerate(entries):
+            env[f"GIT_CONFIG_KEY_{index}"] = key
+            env[f"GIT_CONFIG_VALUE_{index}"] = value
     return env
 
 
@@ -408,8 +437,10 @@ class AppServerClient:
     ) -> "AppServerClient":
         user_env = dict(os.environ if env is None else env)
         excludes_file = resolve_global_excludes_file(user_env)
-        readable = [path for path in (excludes_file, resolve_git_common_dir(cwd, user_env)) if path]
-        env = build_app_server_env(user_env, excludes_file=excludes_file)
+        toplevel, common_dir = resolve_git_paths(cwd, user_env)
+        readable = [path for path in (excludes_file, common_dir) if path]
+        safe_directories = [path for path in (toplevel, common_dir and os.path.dirname(common_dir)) if path]
+        env = build_app_server_env(user_env, excludes_file=excludes_file, safe_directories=safe_directories)
         mcp_server_names = await list_mcp_server_names_with_retry(codex_bin, profile=profile, env=env)
         cmd = build_app_server_command(
             codex_bin,
