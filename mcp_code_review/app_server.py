@@ -36,6 +36,67 @@ BANNED_APP_SERVER_FEATURES = (
 MCP_DISABLED_ERROR_TEXT = "spawned codex attempted MCP tool call; MCP servers must stay disabled"
 _PREFER_PROCESS_MODE = False
 
+# Codex's `read-only` sandbox only forbids *writes*: on macOS (Seatbelt) and Linux
+# (Landlock) it still lets every shell command the model runs read the whole disk
+# (home directory, ~/.ssh, browser data, other repositories...), and whatever is read
+# is sent to the model provider. Reviews therefore run under a dedicated Codex
+# *permissions profile* that only allows reading the minimal platform paths, the
+# reviewed repository (`:project_roots`) and the package-manager prefixes that hold
+# the tools (codex itself, git, rg), with no network access.
+REVIEW_PERMISSION_PROFILE = "mcp-code-review"
+# Package-manager prefixes outside the platform's minimal set (Homebrew on Apple
+# Silicon and Intel). Their `etc/` and `var/` stay denied: they hold service
+# configuration and local databases, not tools.
+TOOL_PREFIX_CANDIDATES = ("/opt/homebrew", "/usr/local")
+TOOL_PREFIX_DENIED_SUBDIRS = ("etc", "var")
+# git must not read the user's or the system's config files (both unreadable under
+# the profile, and the user's may embed credentials in URL rewrites).
+GIT_ISOLATION_ENV = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.excludesFile",
+    "GIT_CONFIG_VALUE_0": "/dev/null",
+}
+
+
+def detect_tool_prefixes(candidates: Optional[tuple[str, ...]] = None) -> List[str]:
+    prefixes: List[str] = []
+    for candidate in candidates if candidates is not None else TOOL_PREFIX_CANDIDATES:
+        if candidate not in prefixes and os.path.isdir(os.path.join(candidate, "bin")):
+            prefixes.append(candidate)
+    return prefixes
+
+
+def build_review_filesystem_policy(tool_prefixes: Optional[List[str]] = None) -> Dict[str, str]:
+    policy: Dict[str, str] = {":minimal": "read", ":project_roots": "read"}
+    for prefix in tool_prefixes if tool_prefixes is not None else detect_tool_prefixes():
+        policy[prefix] = "read"
+        for subdir in TOOL_PREFIX_DENIED_SUBDIRS:
+            policy[os.path.join(prefix, subdir)] = "deny"
+    return policy
+
+
+def _toml_inline_table(entries: Dict[str, str]) -> str:
+    # JSON string literals are valid TOML basic strings for these keys and values.
+    return "{" + ",".join(f"{json.dumps(key)}={json.dumps(value)}" for key, value in entries.items()) + "}"
+
+
+def build_review_permission_assignments(tool_prefixes: Optional[List[str]] = None) -> List[str]:
+    profile = REVIEW_PERMISSION_PROFILE
+    filesystem = build_review_filesystem_policy(tool_prefixes)
+    return [
+        f'default_permissions="{profile}"',
+        f"permissions.{profile}.filesystem={_toml_inline_table(filesystem)}",
+        f"permissions.{profile}.network.enabled=false",
+    ]
+
+
+def build_app_server_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    env = dict(os.environ if base is None else base)
+    env.update(GIT_ISOLATION_ENV)
+    return env
+
 
 def is_concurrency_error(message: str) -> bool:
     if not message:
@@ -166,6 +227,10 @@ def build_app_server_command(
     # trusted (server-side only — never originates from MCP tool input).
     for assignment in extra_config_overrides or []:
         command.extend(["-c", assignment])
+    # The read restriction comes after every other override so that nothing,
+    # caller-supplied or not, can widen what the reviewing model may read.
+    for assignment in build_review_permission_assignments():
+        command.extend(["-c", assignment])
     command.append("app-server")
     return command
 
@@ -269,6 +334,7 @@ class AppServerClient:
         profile: Optional[str] = None,
         extra_config_overrides: Optional[List[str]] = None,
     ) -> "AppServerClient":
+        env = build_app_server_env(env)
         mcp_server_names = await list_mcp_server_names_with_retry(codex_bin, profile=profile, env=env)
         cmd = build_app_server_command(
             codex_bin,
@@ -457,10 +523,12 @@ async def run_single_review(
     additional_developer_instructions: Optional[str] = None,
     review_mode: str = "uncommitted",
 ) -> ReviewResult:
+    # No `sandbox` mode here: an explicit sandbox mode replaces the permissions
+    # profile set on the app-server command line (REVIEW_PERMISSION_PROFILE), and
+    # Codex's `read-only` mode would let the model read the whole disk again.
     thread_params: Dict[str, Any] = {
         "cwd": cwd,
         "approvalPolicy": "never",
-        "sandbox": "read-only",
     }
     if model:
         thread_params["model"] = model
@@ -476,8 +544,8 @@ async def run_single_review(
     if review_mode == "full_repo":
         # Custom target — Codex has no native full-repo review API, so we
         # send the audit prompt as a `custom` target instructing the model
-        # to walk the codebase end-to-end. The sub-process is still
-        # sandbox=read-only / approvalPolicy=never (set above).
+        # to walk the codebase end-to-end. The sub-process still runs under
+        # REVIEW_PERMISSION_PROFILE with approvalPolicy=never.
         base_prompt = build_full_repo_review_prompt()
         target: Dict[str, Any] = {
             "type": "custom",

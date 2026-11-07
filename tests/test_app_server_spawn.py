@@ -5,9 +5,15 @@ from unittest.mock import patch
 from mcp_code_review.app_server import (
     AppServerError,
     BANNED_APP_SERVER_FEATURES,
+    GIT_ISOLATION_ENV,
     MCP_DISABLED_ERROR_TEXT,
     MCP_SERVER_LIST_ATTEMPTS,
+    REVIEW_PERMISSION_PROFILE,
     build_app_server_command,
+    build_app_server_env,
+    build_review_filesystem_policy,
+    build_review_permission_assignments,
+    detect_tool_prefixes,
     is_mcp_tool_call_notification,
     list_mcp_server_names_with_retry,
     parse_mcp_server_names,
@@ -61,6 +67,57 @@ class TestAppServerSpawnConfig(unittest.TestCase):
         self.assertIn(SPAWN_GUARD_CONFIG_ASSIGNMENT, command)
         self.assertIn("mcp_servers.review.enabled=false", command)
         self.assertIn("mcp_servers.serena.enabled=false", command)
+
+    def test_build_app_server_command_restricts_reads_after_every_override(self):
+        command = build_app_server_command(
+            codex_bin="codex",
+            profile=None,
+            mcp_server_names=[],
+            extra_config_overrides=['default_permissions=":danger-no-sandbox"'],
+        )
+        expected = build_review_permission_assignments()
+        # The restriction is the last group of `-c` assignments before `app-server`,
+        # so a caller-supplied override cannot widen it.
+        tail = command[-(2 * len(expected) + 1):-1]
+        self.assertEqual(tail[1::2], expected)
+        self.assertEqual(set(tail[0::2]), {"-c"})
+        self.assertEqual(expected[0], f'default_permissions="{REVIEW_PERMISSION_PROFILE}"')
+        self.assertIn(f"permissions.{REVIEW_PERMISSION_PROFILE}.network.enabled=false", expected)
+
+    def test_review_filesystem_policy_reads_only_platform_project_and_tools(self):
+        policy = build_review_filesystem_policy(["/opt/homebrew"])
+        self.assertEqual(
+            policy,
+            {
+                ":minimal": "read",
+                ":project_roots": "read",
+                "/opt/homebrew": "read",
+                "/opt/homebrew/etc": "deny",
+                "/opt/homebrew/var": "deny",
+            },
+        )
+        self.assertNotIn(":root", policy)
+        self.assertFalse(any(path.startswith("/Users") or path.startswith("/home") for path in policy))
+
+    def test_review_permission_assignment_is_a_toml_inline_table(self):
+        assignment = build_review_permission_assignments(["/opt/homebrew"])[1]
+        self.assertEqual(
+            assignment,
+            f"permissions.{REVIEW_PERMISSION_PROFILE}.filesystem="
+            '{":minimal"="read",":project_roots"="read","/opt/homebrew"="read",'
+            '"/opt/homebrew/etc"="deny","/opt/homebrew/var"="deny"}',
+        )
+
+    def test_detect_tool_prefixes_keeps_existing_prefixes_with_bin(self):
+        with patch("mcp_code_review.app_server.os.path.isdir", side_effect=lambda p: p == "/opt/homebrew/bin"):
+            self.assertEqual(detect_tool_prefixes(("/opt/homebrew", "/usr/local", "/opt/homebrew")), ["/opt/homebrew"])
+
+    def test_app_server_env_isolates_git_config_and_keeps_base(self):
+        env = build_app_server_env({"PATH": "/usr/bin", "GIT_CONFIG_GLOBAL": "/Users/x/.gitconfig"})
+        self.assertEqual(env["PATH"], "/usr/bin")
+        for key, value in GIT_ISOLATION_ENV.items():
+            self.assertEqual(env[key], value)
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], "/dev/null")
 
     def test_is_mcp_tool_call_notification_variants(self):
         self.assertTrue(
@@ -354,7 +411,10 @@ class TestRunSingleReview(unittest.IsolatedAsyncioTestCase):
         thread_start_payload = client.requests[0][1]
         self.assertEqual(thread_start_payload["cwd"], "/tmp/project")
         self.assertEqual(thread_start_payload["approvalPolicy"], "never")
-        self.assertEqual(thread_start_payload["sandbox"], "read-only")
+        # An explicit sandbox mode would replace the read-restricting permissions
+        # profile set on the app-server command line.
+        self.assertNotIn("sandbox", thread_start_payload)
+        self.assertNotIn("sandboxPolicy", thread_start_payload)
         self.assertEqual(thread_start_payload["model"], "gpt-5")
         self.assertEqual(thread_start_payload["modelProvider"], "openai")
         self.assertNotIn("baseInstructions", thread_start_payload)
