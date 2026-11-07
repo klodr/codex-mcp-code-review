@@ -1,3 +1,7 @@
+import os
+import subprocess
+import tempfile
+import tomllib
 import unittest
 from unittest.mock import AsyncMock
 from unittest.mock import patch
@@ -5,10 +9,20 @@ from unittest.mock import patch
 from mcp_code_review.app_server import (
     AppServerError,
     BANNED_APP_SERVER_FEATURES,
+    GIT_ISOLATION_ENV,
     MCP_DISABLED_ERROR_TEXT,
     MCP_SERVER_LIST_ATTEMPTS,
+    REVIEW_PERMISSION_PROFILE,
     build_app_server_command,
+    build_app_server_env,
+    build_review_filesystem_policy,
+    build_review_permission_assignments,
+    detect_tool_prefixes,
+    ensure_review_permission_profile,
     is_mcp_tool_call_notification,
+    resolve_git_common_dir,
+    resolve_git_paths,
+    resolve_global_excludes_file,
     list_mcp_server_names_with_retry,
     parse_mcp_server_names,
     run_reviews,
@@ -61,6 +75,144 @@ class TestAppServerSpawnConfig(unittest.TestCase):
         self.assertIn(SPAWN_GUARD_CONFIG_ASSIGNMENT, command)
         self.assertIn("mcp_servers.review.enabled=false", command)
         self.assertIn("mcp_servers.serena.enabled=false", command)
+
+    def test_build_app_server_command_restricts_reads_after_every_override(self):
+        command = build_app_server_command(
+            codex_bin="codex",
+            profile=None,
+            mcp_server_names=[],
+            extra_config_overrides=['default_permissions=":danger-no-sandbox"'],
+        )
+        expected = build_review_permission_assignments()
+        # The restriction is the last group of `-c` assignments before `app-server`,
+        # so a caller-supplied override cannot widen it.
+        tail = command[-(2 * len(expected) + 1):-1]
+        self.assertEqual(tail[1::2], expected)
+        self.assertEqual(set(tail[0::2]), {"-c"})
+        self.assertEqual(expected[0], f'default_permissions="{REVIEW_PERMISSION_PROFILE}"')
+        self.assertIn(f"permissions.{REVIEW_PERMISSION_PROFILE}.network.enabled=false", expected)
+
+    def test_review_filesystem_policy_reads_only_platform_project_and_tools(self):
+        policy = build_review_filesystem_policy(["/opt/homebrew"])
+        self.assertEqual(
+            policy,
+            {
+                ":minimal": "read",
+                ":project_roots": "read",
+                "/opt/homebrew": "read",
+                "/opt/homebrew/etc": "deny",
+                "/opt/homebrew/var": "deny",
+            },
+        )
+        self.assertNotIn(":root", policy)
+        self.assertFalse(any(path.startswith("/Users") or path.startswith("/home") for path in policy))
+
+    def test_review_permission_assignment_is_a_toml_inline_table(self):
+        assignment = build_review_permission_assignments(["/opt/homebrew"])[1]
+        self.assertEqual(
+            assignment,
+            f"permissions.{REVIEW_PERMISSION_PROFILE}.filesystem="
+            '{":minimal"="read",":project_roots"="read","/opt/homebrew"="read",'
+            '"/opt/homebrew/etc"="deny","/opt/homebrew/var"="deny"}',
+        )
+
+    def test_detect_tool_prefixes_keeps_existing_prefixes_with_bin(self):
+        with patch("mcp_code_review.app_server.os.path.isdir", side_effect=lambda p: p == "/opt/homebrew/bin"):
+            self.assertEqual(detect_tool_prefixes(("/opt/homebrew", "/usr/local", "/opt/homebrew")), ["/opt/homebrew"])
+
+    def test_app_server_env_isolates_git_config_and_keeps_base(self):
+        env = build_app_server_env(
+            {
+                "PATH": "/usr/bin",
+                "GIT_CONFIG_GLOBAL": "/Users/x/.gitconfig",
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_1": "url.https://tok@x/.insteadOf",
+                "GIT_CONFIG_VALUE_1": "https://x/",
+            }
+        )
+        self.assertEqual(env["PATH"], "/usr/bin")
+        for key, value in GIT_ISOLATION_ENV.items():
+            self.assertEqual(env[key], value)
+        self.assertNotIn("GIT_CONFIG_COUNT", env)
+        self.assertNotIn("GIT_CONFIG_KEY_1", env)
+        self.assertNotIn("GIT_CONFIG_VALUE_1", env)
+
+    def test_app_server_env_keeps_the_global_excludes_file(self):
+        env = build_app_server_env({"PATH": "/usr/bin"}, excludes_file="/home/u/.config/git/ignore")
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "core.excludesFile")
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], "/home/u/.config/git/ignore")
+
+    def test_review_filesystem_policy_adds_extra_readable_paths(self):
+        policy = build_review_filesystem_policy([], ["/repo/.git", "/home/u/.config/git/ignore"])
+        self.assertEqual(policy["/repo/.git"], "read")
+        self.assertEqual(policy["/home/u/.config/git/ignore"], "read")
+
+    def test_permission_assignment_parses_as_toml_with_unusual_paths(self):
+        odd = '/home/u/dossier \U0001F600 "cité" \\ tab\there/.config/git/ignore'
+        assignment = build_review_permission_assignments([], [odd])[1]
+        key, _, value = assignment.partition("=")
+        parsed = tomllib.loads(f"x = {value}")["x"]
+        self.assertEqual(parsed[odd], "read")
+        self.assertEqual(parsed[":project_roots"], "read")
+        self.assertTrue(key.endswith(".filesystem"))
+
+    def test_app_server_env_declares_safe_directories(self):
+        env = build_app_server_env({}, excludes_file="/h/ignore", safe_directories=["/r", "/m", "/r"])
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]), ("core.excludesFile", "/h/ignore"))
+        self.assertEqual((env["GIT_CONFIG_KEY_1"], env["GIT_CONFIG_VALUE_1"]), ("safe.directory", "/r"))
+        self.assertEqual((env["GIT_CONFIG_KEY_2"], env["GIT_CONFIG_VALUE_2"]), ("safe.directory", "/m"))
+        self.assertNotIn("GIT_CONFIG_KEY_3", env)
+
+    def test_ensure_review_permission_profile(self):
+        ensure_review_permission_profile({"activePermissionProfile": {"id": REVIEW_PERMISSION_PROFILE}})
+        for response in (None, {}, {"activePermissionProfile": {"id": ":read-only"}}, {"activePermissionProfile": "x"}):
+            with self.assertRaises(AppServerError):
+                ensure_review_permission_profile(response)
+
+
+def _git(*args, cwd):
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", *args],
+        cwd=cwd, check=True, capture_output=True,
+    )
+
+
+class TestGitPathsForReview(unittest.TestCase):
+    def test_global_excludes_file_defaults_to_xdg_location(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {"HOME": home, "PATH": os.environ.get("PATH", "")}
+            self.assertIsNone(resolve_global_excludes_file(env))
+            ignore = os.path.join(home, ".config", "git", "ignore")
+            os.makedirs(os.path.dirname(ignore))
+            with open(ignore, "w") as fh:
+                fh.write("*.env\n")
+            self.assertEqual(resolve_global_excludes_file(env), os.path.abspath(ignore))
+
+    def test_git_common_dir_only_for_linked_worktrees(self):
+        with tempfile.TemporaryDirectory() as root:
+            main = os.path.join(root, "main")
+            linked = os.path.join(root, "linked")
+            os.makedirs(main)
+            _git("init", "-q", cwd=main)
+            with open(os.path.join(main, "f"), "w") as fh:
+                fh.write("x\n")
+            _git("add", "f", cwd=main)
+            _git("commit", "-q", "-m", "init", cwd=main)
+            _git("worktree", "add", "-q", linked, cwd=main)
+            env = dict(os.environ)
+            self.assertEqual(resolve_git_paths(main, env), (os.path.realpath(main), None))
+            self.assertEqual(
+                resolve_git_paths(linked, env),
+                (os.path.realpath(linked), os.path.realpath(os.path.join(main, ".git"))),
+            )
+            self.assertIsNone(resolve_git_common_dir(main, env))
+            self.assertEqual(
+                resolve_git_common_dir(linked, env), os.path.realpath(os.path.join(main, ".git"))
+            )
+            self.assertIsNone(resolve_git_common_dir(root, env))
+            self.assertIsNone(resolve_git_common_dir(None, env))
 
     def test_is_mcp_tool_call_notification_variants(self):
         self.assertTrue(
@@ -326,7 +478,10 @@ class _RecordingClient:
     async def request(self, method, params=None):
         self.requests.append((method, params))
         if method == "thread/start":
-            return {"thread": {"id": "thread-1"}}
+            return {
+                "thread": {"id": "thread-1"},
+                "activePermissionProfile": {"id": REVIEW_PERMISSION_PROFILE, "extends": None},
+            }
         if method == "review/start":
             return {"turn": {"id": "turn-1"}, "reviewThreadId": "thread-1"}
         raise AssertionError(f"unexpected method: {method}")
@@ -338,6 +493,18 @@ class _RecordingClient:
 
 
 class TestRunSingleReview(unittest.IsolatedAsyncioTestCase):
+    async def test_refuses_to_review_without_the_permission_profile(self):
+        client = _RecordingClient()
+
+        async def request(method, params=None):
+            client.requests.append((method, params))
+            return {"thread": {"id": "thread-1"}}
+
+        client.request = request
+        with self.assertRaises(AppServerError):
+            await run_single_review(client, cwd="/tmp/project", timeout_seconds=5)
+        self.assertEqual([m for m, _ in client.requests], ["thread/start"])
+
     async def test_thread_start_payload_omits_base_instructions(self):
         client = _RecordingClient()
 
@@ -354,7 +521,10 @@ class TestRunSingleReview(unittest.IsolatedAsyncioTestCase):
         thread_start_payload = client.requests[0][1]
         self.assertEqual(thread_start_payload["cwd"], "/tmp/project")
         self.assertEqual(thread_start_payload["approvalPolicy"], "never")
-        self.assertEqual(thread_start_payload["sandbox"], "read-only")
+        # An explicit sandbox mode would replace the read-restricting permissions
+        # profile set on the app-server command line.
+        self.assertNotIn("sandbox", thread_start_payload)
+        self.assertNotIn("sandboxPolicy", thread_start_payload)
         self.assertEqual(thread_start_payload["model"], "gpt-5")
         self.assertEqual(thread_start_payload["modelProvider"], "openai")
         self.assertNotIn("baseInstructions", thread_start_payload)

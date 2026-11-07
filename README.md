@@ -193,4 +193,10 @@ args = [
 - When disabled with `--disable additional_review_instructions`, the tool schema does not advertise
   `additional_developer_instructions`, and requests that send it anyway are rejected.
 - Default runs: 4 (override by setting `--parallelism` on the MCP server config).
-- Sandbox: read-only; approval policy: never.
+- Approval policy: never. Reads are confined by a Codex permissions profile (`mcp-code-review`):
+  the platform's minimal paths (`:minimal`), the reviewed repository (`:project_roots`) and the
+  tool prefixes `/opt/homebrew` and `/usr/local` when present (their `etc/` and `var/` denied);
+  no network. Codex's own `read-only` sandbox is *not* used: it forbids writes but lets the
+  model read the whole disk (home directory, `~/.ssh`, other repositories), and anything read
+  is sent to the model provider. git runs with `GIT_CONFIG_GLOBAL=/dev/null` and
+  `GIT_CONFIG_NOSYSTEM=1`, since its config files are outside the readable set.

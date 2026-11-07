@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+import subprocess
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,163 @@ BANNED_APP_SERVER_FEATURES = (
 MCP_DISABLED_ERROR_TEXT = "spawned codex attempted MCP tool call; MCP servers must stay disabled"
 _PREFER_PROCESS_MODE = False
 
+# Codex's `read-only` sandbox only forbids *writes*: on macOS (Seatbelt) and Linux
+# (Landlock) it still lets every shell command the model runs read the whole disk
+# (home directory, ~/.ssh, browser data, other repositories...), and whatever is read
+# is sent to the model provider. Reviews therefore run under a dedicated Codex
+# *permissions profile* that only allows reading the minimal platform paths, the
+# reviewed repository (`:project_roots`) and the package-manager prefixes that hold
+# the tools (codex itself, git, rg), with no network access.
+REVIEW_PERMISSION_PROFILE = "mcp-code-review"
+# Package-manager prefixes outside the platform's minimal set (Homebrew on Apple
+# Silicon and Intel). Their `etc/` and `var/` stay denied: they hold service
+# configuration and local databases, not tools.
+TOOL_PREFIX_CANDIDATES = ("/opt/homebrew", "/usr/local")
+TOOL_PREFIX_DENIED_SUBDIRS = ("etc", "var")
+# git must not read the user's or the system's config files (both unreadable under
+# the profile, and the user's may embed credentials in URL rewrites). The user's
+# global excludes file is kept (and made readable): dropping it would turn files
+# the user ignores globally (e.g. `.env`) into untracked files sent for review.
+GIT_ISOLATION_ENV = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+PERMISSION_PROFILE_ERROR_TEXT = "codex did not apply the read-restricting permissions profile"
+
+
+def detect_tool_prefixes(candidates: Optional[tuple[str, ...]] = None) -> List[str]:
+    prefixes: List[str] = []
+    for candidate in candidates if candidates is not None else TOOL_PREFIX_CANDIDATES:
+        if candidate not in prefixes and os.path.isdir(os.path.join(candidate, "bin")):
+            prefixes.append(candidate)
+    return prefixes
+
+
+def _git_output(args: List[str], env: Dict[str, str], cwd: Optional[str] = None) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = result.stdout.strip()
+    return output if result.returncode == 0 and output else None
+
+
+def resolve_global_excludes_file(env: Dict[str, str]) -> Optional[str]:
+    """The user's global gitignore, as git itself would find it (read with the user's env)."""
+    path = _git_output(["config", "--global", "--path", "--get", "core.excludesFile"], env)
+    if path is None:
+        config_home = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME", ""), ".config")
+        path = os.path.join(config_home, "git", "ignore")
+    path = os.path.abspath(os.path.expanduser(path))
+    return path if os.path.isfile(path) else None
+
+
+def resolve_git_paths(cwd: Optional[str], env: Dict[str, str]) -> tuple[Optional[str], Optional[str]]:
+    """(worktree top level, git common dir when it lies outside it), resolved with the user's env.
+
+    The metadata of a linked worktree lives in the main repository, outside `cwd`.
+    A top level resolved here means the user's own git trusts the repository
+    (ownership or `safe.directory`), a decision the isolated env must keep.
+    """
+    if not cwd:
+        return None, None
+    toplevel = _git_output(["rev-parse", "--show-toplevel"], env, cwd=cwd)
+    common_dir = _git_output(["rev-parse", "--path-format=absolute", "--git-common-dir"], env, cwd=cwd)
+    if toplevel is None:
+        return None, None
+    toplevel = os.path.realpath(toplevel)
+    if common_dir is None:
+        return toplevel, None
+    common_dir = os.path.realpath(common_dir)
+    if common_dir == toplevel or common_dir.startswith(toplevel + os.sep):
+        return toplevel, None  # Already inside :project_roots.
+    return toplevel, common_dir
+
+
+def resolve_git_common_dir(cwd: Optional[str], env: Dict[str, str]) -> Optional[str]:
+    return resolve_git_paths(cwd, env)[1]
+
+
+def build_review_filesystem_policy(
+    tool_prefixes: Optional[List[str]] = None,
+    extra_readable_paths: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    policy: Dict[str, str] = {":minimal": "read", ":project_roots": "read"}
+    for prefix in tool_prefixes if tool_prefixes is not None else detect_tool_prefixes():
+        policy[prefix] = "read"
+        for subdir in TOOL_PREFIX_DENIED_SUBDIRS:
+            policy[os.path.join(prefix, subdir)] = "deny"
+    for path in extra_readable_paths or []:
+        policy[path] = "read"
+    return policy
+
+
+def _toml_basic_string(value: str) -> str:
+    # Not json.dumps: it escapes non-BMP characters as surrogate pairs, invalid in TOML.
+    out = []
+    for char in value:
+        code = ord(char)
+        if char in ('"', "\\"):
+            out.append("\\" + char)
+        elif code < 0x20 or code == 0x7F:
+            out.append(f"\\u{code:04X}")
+        else:
+            out.append(char)
+    return '"' + "".join(out) + '"'
+
+
+def _toml_inline_table(entries: Dict[str, str]) -> str:
+    return "{" + ",".join(f"{_toml_basic_string(key)}={_toml_basic_string(value)}" for key, value in entries.items()) + "}"
+
+
+def build_review_permission_assignments(
+    tool_prefixes: Optional[List[str]] = None,
+    extra_readable_paths: Optional[List[str]] = None,
+) -> List[str]:
+    profile = REVIEW_PERMISSION_PROFILE
+    filesystem = build_review_filesystem_policy(tool_prefixes, extra_readable_paths)
+    return [
+        f'default_permissions="{profile}"',
+        f"permissions.{profile}.filesystem={_toml_inline_table(filesystem)}",
+        f"permissions.{profile}.network.enabled=false",
+    ]
+
+
+def build_app_server_env(
+    base: Optional[Dict[str, str]] = None,
+    excludes_file: Optional[str] = None,
+    safe_directories: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    env = dict(os.environ if base is None else base)
+    env.update(GIT_ISOLATION_ENV)
+    for key in [k for k in env if k.startswith("GIT_CONFIG_KEY_") or k.startswith("GIT_CONFIG_VALUE_")]:
+        del env[key]
+    env.pop("GIT_CONFIG_COUNT", None)
+    entries: List[tuple[str, str]] = []
+    if excludes_file:
+        entries.append(("core.excludesFile", excludes_file))
+    # Command-scope config (GIT_CONFIG_COUNT) is "protected": git honours safe.directory there.
+    for directory in dict.fromkeys(safe_directories or []):
+        entries.append(("safe.directory", directory))
+    if entries:
+        env["GIT_CONFIG_COUNT"] = str(len(entries))
+        for index, (key, value) in enumerate(entries):
+            env[f"GIT_CONFIG_KEY_{index}"] = key
+            env[f"GIT_CONFIG_VALUE_{index}"] = value
+    return env
+
+
+def ensure_review_permission_profile(thread_response: Optional[Dict[str, Any]]) -> None:
+    active = (thread_response or {}).get("activePermissionProfile") or {}
+    active_id = active.get("id") if isinstance(active, dict) else None
+    if active_id != REVIEW_PERMISSION_PROFILE:
+        raise AppServerError(
+            f"{PERMISSION_PROFILE_ERROR_TEXT} {REVIEW_PERMISSION_PROFILE!r} "
+            f"(active: {active_id!r}); refusing to review"
+        )
+
 
 def is_concurrency_error(message: str) -> bool:
     if not message:
@@ -58,6 +216,8 @@ def should_fallback_to_process_mode(error: Exception) -> bool:
     if isinstance(error, AppServerError):
         message = str(error)
         if MCP_DISABLED_ERROR_TEXT in message:
+            return False
+        if PERMISSION_PROFILE_ERROR_TEXT in message:
             return False
         if "codex review timed out after" in message.lower():
             return False
@@ -151,6 +311,7 @@ def build_app_server_command(
     profile: Optional[str],
     mcp_server_names: List[str],
     extra_config_overrides: Optional[List[str]] = None,
+    extra_readable_paths: Optional[List[str]] = None,
 ) -> List[str]:
     command = [codex_bin]
     if profile:
@@ -165,6 +326,10 @@ def build_app_server_command(
     # assignment (e.g. `model_reasoning_effort=high`). The caller is
     # trusted (server-side only — never originates from MCP tool input).
     for assignment in extra_config_overrides or []:
+        command.extend(["-c", assignment])
+    # The read restriction comes after every other override so that nothing,
+    # caller-supplied or not, can widen what the reviewing model may read.
+    for assignment in build_review_permission_assignments(extra_readable_paths=extra_readable_paths):
         command.extend(["-c", assignment])
     command.append("app-server")
     return command
@@ -268,13 +433,21 @@ class AppServerClient:
         env: Optional[Dict[str, str]] = None,
         profile: Optional[str] = None,
         extra_config_overrides: Optional[List[str]] = None,
+        cwd: Optional[str] = None,
     ) -> "AppServerClient":
+        user_env = dict(os.environ if env is None else env)
+        excludes_file = resolve_global_excludes_file(user_env)
+        toplevel, common_dir = resolve_git_paths(cwd, user_env)
+        readable = [path for path in (excludes_file, common_dir) if path]
+        safe_directories = [path for path in (toplevel, common_dir and os.path.dirname(common_dir)) if path]
+        env = build_app_server_env(user_env, excludes_file=excludes_file, safe_directories=safe_directories)
         mcp_server_names = await list_mcp_server_names_with_retry(codex_bin, profile=profile, env=env)
         cmd = build_app_server_command(
             codex_bin,
             profile,
             mcp_server_names,
             extra_config_overrides=extra_config_overrides,
+            extra_readable_paths=readable,
         )
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -457,10 +630,12 @@ async def run_single_review(
     additional_developer_instructions: Optional[str] = None,
     review_mode: str = "uncommitted",
 ) -> ReviewResult:
+    # No `sandbox` mode here: an explicit sandbox mode replaces the permissions
+    # profile set on the app-server command line (REVIEW_PERMISSION_PROFILE), and
+    # Codex's `read-only` mode would let the model read the whole disk again.
     thread_params: Dict[str, Any] = {
         "cwd": cwd,
         "approvalPolicy": "never",
-        "sandbox": "read-only",
     }
     if model:
         thread_params["model"] = model
@@ -468,6 +643,7 @@ async def run_single_review(
         thread_params["modelProvider"] = model_provider
 
     thread_response = await client.request("thread/start", thread_params)
+    ensure_review_permission_profile(thread_response)
     thread = (thread_response or {}).get("thread", {})
     thread_id = thread.get("id")
     if not thread_id:
@@ -476,8 +652,8 @@ async def run_single_review(
     if review_mode == "full_repo":
         # Custom target — Codex has no native full-repo review API, so we
         # send the audit prompt as a `custom` target instructing the model
-        # to walk the codebase end-to-end. The sub-process is still
-        # sandbox=read-only / approvalPolicy=never (set above).
+        # to walk the codebase end-to-end. The sub-process still runs under
+        # REVIEW_PERMISSION_PROFILE with approvalPolicy=never.
         base_prompt = build_full_repo_review_prompt()
         target: Dict[str, Any] = {
             "type": "custom",
@@ -544,6 +720,7 @@ async def run_reviews_threads(
         codex_bin,
         profile=profile,
         extra_config_overrides=extra_config_overrides,
+        cwd=cwd,
     )
     try:
         await client.initialize()
@@ -596,6 +773,7 @@ async def run_review_process(
         codex_bin,
         profile=profile,
         extra_config_overrides=extra_config_overrides,
+        cwd=cwd,
     )
     try:
         await client.initialize()

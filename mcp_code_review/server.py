@@ -125,7 +125,8 @@ def full_repo_tool_definition(config: ServerConfig) -> Dict[str, Any]:
             "changes). Codex walks the project tree from the entry points and "
             "produces prioritized P0/P1 findings. Runs in parallel (set `runs` "
             "for multi-run vote aggregation) at maximum reasoning effort. "
-            "Sandbox=read-only and approvalPolicy=never are forced upstream. "
+            "Reads are confined to the repository, the platform's minimal paths "
+            "and the tool prefixes (no network); approvalPolicy=never. "
             "Returns structured results for each run."
         ),
         "inputSchema": {
