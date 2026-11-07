@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+import subprocess
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -50,14 +51,14 @@ REVIEW_PERMISSION_PROFILE = "mcp-code-review"
 TOOL_PREFIX_CANDIDATES = ("/opt/homebrew", "/usr/local")
 TOOL_PREFIX_DENIED_SUBDIRS = ("etc", "var")
 # git must not read the user's or the system's config files (both unreadable under
-# the profile, and the user's may embed credentials in URL rewrites).
+# the profile, and the user's may embed credentials in URL rewrites). The user's
+# global excludes file is kept (and made readable): dropping it would turn files
+# the user ignores globally (e.g. `.env`) into untracked files sent for review.
 GIT_ISOLATION_ENV = {
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_NOSYSTEM": "1",
-    "GIT_CONFIG_COUNT": "1",
-    "GIT_CONFIG_KEY_0": "core.excludesFile",
-    "GIT_CONFIG_VALUE_0": "/dev/null",
 }
+PERMISSION_PROFILE_ERROR_TEXT = "codex did not apply the read-restricting permissions profile"
 
 
 def detect_tool_prefixes(candidates: Optional[tuple[str, ...]] = None) -> List[str]:
@@ -68,12 +69,52 @@ def detect_tool_prefixes(candidates: Optional[tuple[str, ...]] = None) -> List[s
     return prefixes
 
 
-def build_review_filesystem_policy(tool_prefixes: Optional[List[str]] = None) -> Dict[str, str]:
+def _git_output(args: List[str], env: Dict[str, str], cwd: Optional[str] = None) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = result.stdout.strip()
+    return output if result.returncode == 0 and output else None
+
+
+def resolve_global_excludes_file(env: Dict[str, str]) -> Optional[str]:
+    """The user's global gitignore, as git itself would find it (read with the user's env)."""
+    path = _git_output(["config", "--global", "--path", "--get", "core.excludesFile"], env)
+    if path is None:
+        config_home = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME", ""), ".config")
+        path = os.path.join(config_home, "git", "ignore")
+    path = os.path.abspath(os.path.expanduser(path))
+    return path if os.path.isfile(path) else None
+
+
+def resolve_git_common_dir(cwd: Optional[str], env: Dict[str, str]) -> Optional[str]:
+    """Git metadata of a linked worktree lives in the main repository, outside `cwd`."""
+    if not cwd:
+        return None
+    common_dir = _git_output(["rev-parse", "--path-format=absolute", "--git-common-dir"], env, cwd=cwd)
+    toplevel = _git_output(["rev-parse", "--show-toplevel"], env, cwd=cwd)
+    if common_dir is None or toplevel is None:
+        return None
+    common_dir = os.path.realpath(common_dir)
+    if common_dir == os.path.realpath(toplevel) or common_dir.startswith(os.path.realpath(toplevel) + os.sep):
+        return None  # Already inside :project_roots.
+    return common_dir
+
+
+def build_review_filesystem_policy(
+    tool_prefixes: Optional[List[str]] = None,
+    extra_readable_paths: Optional[List[str]] = None,
+) -> Dict[str, str]:
     policy: Dict[str, str] = {":minimal": "read", ":project_roots": "read"}
     for prefix in tool_prefixes if tool_prefixes is not None else detect_tool_prefixes():
         policy[prefix] = "read"
         for subdir in TOOL_PREFIX_DENIED_SUBDIRS:
             policy[os.path.join(prefix, subdir)] = "deny"
+    for path in extra_readable_paths or []:
+        policy[path] = "read"
     return policy
 
 
@@ -82,9 +123,12 @@ def _toml_inline_table(entries: Dict[str, str]) -> str:
     return "{" + ",".join(f"{json.dumps(key)}={json.dumps(value)}" for key, value in entries.items()) + "}"
 
 
-def build_review_permission_assignments(tool_prefixes: Optional[List[str]] = None) -> List[str]:
+def build_review_permission_assignments(
+    tool_prefixes: Optional[List[str]] = None,
+    extra_readable_paths: Optional[List[str]] = None,
+) -> List[str]:
     profile = REVIEW_PERMISSION_PROFILE
-    filesystem = build_review_filesystem_policy(tool_prefixes)
+    filesystem = build_review_filesystem_policy(tool_prefixes, extra_readable_paths)
     return [
         f'default_permissions="{profile}"',
         f"permissions.{profile}.filesystem={_toml_inline_table(filesystem)}",
@@ -92,10 +136,34 @@ def build_review_permission_assignments(tool_prefixes: Optional[List[str]] = Non
     ]
 
 
-def build_app_server_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+def build_app_server_env(
+    base: Optional[Dict[str, str]] = None,
+    excludes_file: Optional[str] = None,
+) -> Dict[str, str]:
     env = dict(os.environ if base is None else base)
     env.update(GIT_ISOLATION_ENV)
+    for key in [k for k in env if k.startswith("GIT_CONFIG_KEY_") or k.startswith("GIT_CONFIG_VALUE_")]:
+        del env[key]
+    env.pop("GIT_CONFIG_COUNT", None)
+    if excludes_file:
+        env.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.excludesFile",
+                "GIT_CONFIG_VALUE_0": excludes_file,
+            }
+        )
     return env
+
+
+def ensure_review_permission_profile(thread_response: Optional[Dict[str, Any]]) -> None:
+    active = (thread_response or {}).get("activePermissionProfile") or {}
+    active_id = active.get("id") if isinstance(active, dict) else None
+    if active_id != REVIEW_PERMISSION_PROFILE:
+        raise AppServerError(
+            f"{PERMISSION_PROFILE_ERROR_TEXT} {REVIEW_PERMISSION_PROFILE!r} "
+            f"(active: {active_id!r}); refusing to review"
+        )
 
 
 def is_concurrency_error(message: str) -> bool:
@@ -119,6 +187,8 @@ def should_fallback_to_process_mode(error: Exception) -> bool:
     if isinstance(error, AppServerError):
         message = str(error)
         if MCP_DISABLED_ERROR_TEXT in message:
+            return False
+        if PERMISSION_PROFILE_ERROR_TEXT in message:
             return False
         if "codex review timed out after" in message.lower():
             return False
@@ -212,6 +282,7 @@ def build_app_server_command(
     profile: Optional[str],
     mcp_server_names: List[str],
     extra_config_overrides: Optional[List[str]] = None,
+    extra_readable_paths: Optional[List[str]] = None,
 ) -> List[str]:
     command = [codex_bin]
     if profile:
@@ -229,7 +300,7 @@ def build_app_server_command(
         command.extend(["-c", assignment])
     # The read restriction comes after every other override so that nothing,
     # caller-supplied or not, can widen what the reviewing model may read.
-    for assignment in build_review_permission_assignments():
+    for assignment in build_review_permission_assignments(extra_readable_paths=extra_readable_paths):
         command.extend(["-c", assignment])
     command.append("app-server")
     return command
@@ -333,14 +404,19 @@ class AppServerClient:
         env: Optional[Dict[str, str]] = None,
         profile: Optional[str] = None,
         extra_config_overrides: Optional[List[str]] = None,
+        cwd: Optional[str] = None,
     ) -> "AppServerClient":
-        env = build_app_server_env(env)
+        user_env = dict(os.environ if env is None else env)
+        excludes_file = resolve_global_excludes_file(user_env)
+        readable = [path for path in (excludes_file, resolve_git_common_dir(cwd, user_env)) if path]
+        env = build_app_server_env(user_env, excludes_file=excludes_file)
         mcp_server_names = await list_mcp_server_names_with_retry(codex_bin, profile=profile, env=env)
         cmd = build_app_server_command(
             codex_bin,
             profile,
             mcp_server_names,
             extra_config_overrides=extra_config_overrides,
+            extra_readable_paths=readable,
         )
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -536,6 +612,7 @@ async def run_single_review(
         thread_params["modelProvider"] = model_provider
 
     thread_response = await client.request("thread/start", thread_params)
+    ensure_review_permission_profile(thread_response)
     thread = (thread_response or {}).get("thread", {})
     thread_id = thread.get("id")
     if not thread_id:
@@ -612,6 +689,7 @@ async def run_reviews_threads(
         codex_bin,
         profile=profile,
         extra_config_overrides=extra_config_overrides,
+        cwd=cwd,
     )
     try:
         await client.initialize()
@@ -664,6 +742,7 @@ async def run_review_process(
         codex_bin,
         profile=profile,
         extra_config_overrides=extra_config_overrides,
+        cwd=cwd,
     )
     try:
         await client.initialize()
